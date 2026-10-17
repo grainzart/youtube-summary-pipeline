@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Собрать готовый md-конспект из рабочих файлов конвейера.
 
-Читает workdir/meta.json, summary.md, transcript_ru.md и склеивает их
+Читает workdir/meta.json, summary.md, стенограмма.md и склеивает их
 в один файл по шаблону TEMPLATE.md:
 vid-блок -> ## Саммари -> ## Мои заметки -> ## Стенограмма
 (разделы разделяются линией ---; после подзаголовков пустых строк не остаётся;
@@ -92,7 +92,7 @@ def main() -> None:
     if not summary:
         print(f"ОШИБКА: не найден или пуст {workdir / 'summary.md'}", file=sys.stderr)
         sys.exit(1)
-    transcript = load(workdir / "transcript_ru.md")
+    transcript = load(workdir / "стенограмма.md")
 
     parts = [vid_block(meta), "## Саммари\n" + normalize(summary)]
     parts.append("---\n\n## Мои заметки")
