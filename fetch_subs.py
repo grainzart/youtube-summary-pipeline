@@ -6,8 +6,12 @@
   2) оригинальная автораскадровка (её язык = язык видео), если это ru или en;
   3) автоперевод автораскадровки: ru, затем en.
 
-Результат кладётся в work/<Автор>_<Название>_[<video_id>]/ (без пробелов): meta.json, transcript.txt, raw.vtt.
-На stdout печатается одна строка JSON с путями и параметрами.
+Скачиванием файла субтитров занимается сам yt-dlp (своим клиентом с полным
+контекстом запроса) — прямые запросы к эндпоинту timedtext YouTube отбивает
+ошибкой 429.
+
+Результат кладётся в work/<Автор>_<Название>_[<video_id>]/ (без пробелов):
+meta.json, transcript.txt, raw.vtt. На stdout — одна строка JSON.
 """
 
 from __future__ import annotations
@@ -17,14 +21,12 @@ import html
 import json
 import re
 import sys
-import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
 ROOT = Path(__file__).resolve().parent
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 LANGS = ("ru", "en")
 
 TAG_RE = re.compile(r"<[^>]+>")
@@ -44,65 +46,58 @@ def norm_lang(code: str) -> str:
     return code.split("-")[0].split("_")[0].lower()
 
 
-def pick_format(tracks: list[dict]) -> dict | None:
-    for ext in ("vtt", "srt"):
-        for t in tracks:
-            if t.get("ext") == ext:
-                return t
-    return tracks[0] if tracks else None
-
-
 def is_original_auto(track: dict) -> bool:
     # У автопереведённых дорожек в URL есть параметр tlang; у оригинала его нет.
     q = parse_qs(urlparse(track.get("url", "")).query)
     return "tlang" not in q
 
 
-def by_norm_lang(tracks_map: dict[str, list]) -> dict[str, list]:
-    out: dict[str, list] = {}
-    for lang, tracks in tracks_map.items():
-        n = norm_lang(lang)
-        if n not in out and tracks:
-            out[n] = tracks
-    return out
-
-
 def choose_track(subs: dict, autos: dict, forced: str):
-    """Возвращает (lang, source, track) или None. source: manual | auto | auto-translated."""
-    manual = by_norm_lang(subs)
-    auto = by_norm_lang(autos)
+    """Возвращает (точный_ключ_дорожки, язык, источник) или None.
+
+    Точный ключ нужен yt-dlp для скачивания; язык: ru|en;
+    источник: manual | auto | auto-translated.
+    """
     if forced in LANGS:
-        if manual.get(forced):
-            return forced, "manual", pick_format(manual[forced])
-        if auto.get(forced):
-            src = "auto" if is_original_auto(auto[forced][0]) else "auto-translated"
-            return forced, src, pick_format(auto[forced])
+        for key, tracks in subs.items():
+            if norm_lang(key) == forced and tracks:
+                return key, forced, "manual"
+        for key, tracks in autos.items():
+            if norm_lang(key) == forced and tracks:
+                src = "auto" if is_original_auto(tracks[0]) else "auto-translated"
+                return key, forced, src
         return None
     for lang in LANGS:  # ручные субтитры точнее автораскадровки
-        tr = pick_format(manual.get(lang) or [])
-        if tr:
-            return lang, "manual", tr
-    for lang, tracks in auto.items():  # оригинальная автораскадровка = язык видео
-        tr = pick_format(tracks)
-        if tr and lang in LANGS and is_original_auto(tracks[0]):
-            return lang, "auto", tr
+        for key, tracks in subs.items():
+            if norm_lang(key) == lang and tracks:
+                return key, lang, "manual"
+    for lang in LANGS:  # оригинальная автораскадровка = язык видео
+        for key, tracks in autos.items():
+            if norm_lang(key) == lang and tracks and is_original_auto(tracks[0]):
+                return key, lang, "auto"
     for lang in LANGS:  # автоперевод; ru приоритетнее — конспект всё равно на русском
-        tr = pick_format(auto.get(lang) or [])
-        if tr:
-            return lang, "auto-translated", tr
+        for key, tracks in autos.items():
+            if norm_lang(key) == lang and tracks:
+                return key, lang, "auto-translated"
     return None
 
 
-def fetch_info(url: str) -> dict:
+def ydl_opts(**extra) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "no_progress": True,
+        "noprogress": True,
         "skip_download": True,
         "noplaylist": True,
         "socket_timeout": 30,
+        "retries": 5,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    opts.update(extra)
+    return opts
+
+
+def fetch_info(url: str) -> dict:
+    with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
     if info and "entries" in info:  # ytsearchN:... или плейлист — берём первое видео
         entries = [e for e in info["entries"] if e]
@@ -112,10 +107,25 @@ def fetch_info(url: str) -> dict:
     return info
 
 
-def download_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def download_subtitles(url: str, lang_key: str, manual: bool, out_base: Path) -> Path:
+    """Скачивает дорожку субтитров yt-dlp'ом; возвращает путь к файлу .vtt/.srt."""
+    opts = ydl_opts(
+        writesubtitles=manual,
+        writeautomaticsub=not manual,
+        subtitleslangs=[lang_key],
+        subtitlesformat="vtt/best",
+        outtmpl=str(out_base),
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    found = [
+        p
+        for p in out_base.parent.iterdir()
+        if p.name.startswith(out_base.name + ".") and p.suffix in (".vtt", ".srt")
+    ]
+    if not found:
+        raise RuntimeError("yt-dlp не смог скачать файл субтитров")
+    return found[0]
 
 
 def unescape(text: str) -> str:
@@ -210,7 +220,7 @@ def build_paragraphs(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Скачать субтитры YouTube-видео для саммаризации")
     ap.add_argument("url", help="ссылка на видео (или ytsearchN:запрос)")
-    ap.add_argument("--out", default=None, help="рабочая папка (по умолчанию work/<video_id>)")
+    ap.add_argument("--out", default=None, help="рабочая папка (по умолчанию work/<Автор>_<Название>_[<id>])")
     ap.add_argument("--lang", default="auto", choices=["auto", "ru", "en"], help="язык субтитров")
     ap.add_argument("--timestamps", action="store_true", help="добавлять [ММ:СС] в начало абзацев")
     args = ap.parse_args()
@@ -220,29 +230,6 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"ОШИБКА: не удалось получить данные видео: {e}", file=sys.stderr)
         sys.exit(1)
-
-    subs = info.get("subtitles") or {}
-    autos = info.get("automatic_captions") or {}
-    chosen = choose_track(subs, autos, args.lang)
-    if not chosen:
-        print(
-            "ОШИБКА: у видео нет субтитров на ru/en (ни ручных, ни автоматических) — обработка невозможна.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    lang, source, track = chosen
-
-    try:
-        raw = download_text(track["url"])
-    except Exception as e:  # noqa: BLE001
-        print(f"ОШИБКА: не удалось скачать файл субтитров: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    events = dedupe_rolling(parse_vtt(raw))
-    if not events:
-        print("ОШИБКА: файл субтитров пуст или не удалось его разобрать.", file=sys.stderr)
-        sys.exit(1)
-    transcript = build_paragraphs(events, args.timestamps)
 
     vid = info.get("id") or "video"
     if args.out:
@@ -255,9 +242,36 @@ def main() -> None:
         title = (info.get("title") or "").strip()
         base = "_".join(x for x in (safe_dir_name(author), safe_dir_name(title)) if x) or vid
         workdir = ROOT / "work" / f"{base}_[{vid}]"
+
+    subs = info.get("subtitles") or {}
+    autos = info.get("automatic_captions") or {}
+    chosen = choose_track(subs, autos, args.lang)
+    if not chosen:
+        print(
+            "ОШИБКА: у видео нет субтитров на ru/en (ни ручных, ни автоматических) — обработка невозможна.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    key, lang, source = chosen
+
     workdir.mkdir(parents=True, exist_ok=True)
-    (workdir / "raw.vtt").write_text(raw, encoding="utf-8")
-    (workdir / "transcript.txt").write_text(transcript + "\n", encoding="utf-8")
+    try:
+        vtt_path = download_subtitles(args.url, key, source == "manual", workdir / "subs")
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        hint = ""
+        if "429" in msg or "too many requests" in msg.lower():
+            hint = " Это лимит запросов YouTube по IP: подожди 1–2 минуты и повтори один раз; частые повторы продлевают блокировку."
+        print(f"ОШИБКА: не удалось скачать субтитры: {msg}.{hint}", file=sys.stderr)
+        sys.exit(1)
+
+    raw = vtt_path.read_text(encoding="utf-8", errors="replace")
+    vtt_path.unlink(missing_ok=True)
+    events = dedupe_rolling(parse_vtt(raw))
+    if not events:
+        print("ОШИБКА: файл субтитров пуст или не удалось его разобрать.", file=sys.stderr)
+        sys.exit(1)
+    transcript = build_paragraphs(events, args.timestamps)
 
     meta = {
         "video_id": vid,
@@ -271,23 +285,29 @@ def main() -> None:
         "sub_language": lang,
         "sub_source": source,
     }
+    (workdir / "raw.vtt").write_text(raw, encoding="utf-8")
+    (workdir / "transcript.txt").write_text(transcript + "\n", encoding="utf-8")
     (workdir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    result = {
-        "ok": True,
-        "work": str(workdir),
-        "transcript": str(workdir / "transcript.txt"),
-        "meta": str(workdir / "meta.json"),
-        "lang": lang,
-        "source": source,
-        "chars": len(transcript),
-        "title": meta["title"],
-        "author": meta["author"],
-        "duration_sec": meta["duration_sec"],
-    }
-    print(json.dumps(result, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "work": str(workdir),
+                "transcript": str(workdir / "transcript.txt"),
+                "meta": str(workdir / "meta.json"),
+                "lang": lang,
+                "source": source,
+                "chars": len(transcript),
+                "title": meta["title"],
+                "author": meta["author"],
+                "duration_sec": meta["duration_sec"],
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
