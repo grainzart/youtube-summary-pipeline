@@ -2,9 +2,12 @@
 """Скачать субтитры и метаданные YouTube-видео для пайплайна саммаризации.
 
 Выбор дорожки субтитров (--lang auto, по умолчанию):
-  1) ручные субтитры: ru, затем en;
-  2) оригинальная автораскадровка (её язык = язык видео), если это ru или en;
-  3) автоперевод автораскадровки: ru, затем en.
+  1) определяется язык ОРИГИНАЛА видео — по метаданным (поле language), иначе
+     по дорожке '-orig'/без tlang; субтитры берутся на языке оригинала:
+     ручные, иначе оригинальная автораскадровка. У видео с дубляжами есть
+     'оригинальные' автораскадровки каждого дубляжа — берётся именно язык
+     оригинала, а не перевод;
+  2) если оригинал не ru/en — ручные ru/en, затем автоперевод (ru, затем en).
 
 Скачиванием файла субтитров занимается сам yt-dlp (своим клиентом с полным
 контекстом запроса) — прямые запросы к эндпоинту timedtext YouTube отбивает
@@ -52,33 +55,65 @@ def is_original_auto(track: dict) -> bool:
     return "tlang" not in q
 
 
-def choose_track(subs: dict, autos: dict, forced: str):
+def find_track(tracks_map: dict, lang: str, original_only: bool = False) -> str | None:
+    """Ищет ключ дорожки языка lang; при original_only — только оригинальную."""
+    for key, tracks in tracks_map.items():
+        if norm_lang(key) != lang or not tracks:
+            continue
+        if original_only and not (key.endswith("-orig") or is_original_auto(tracks[0])):
+            continue
+        return key
+    return None
+
+
+def choose_track(subs: dict, autos: dict, forced: str, video_lang: str = ""):
     """Возвращает (точный_ключ_дорожки, язык, источник) или None.
 
     Точный ключ нужен yt-dlp для скачивания; язык: ru|en;
     источник: manual | auto | auto-translated.
     """
     if forced in LANGS:
-        for key, tracks in subs.items():
-            if norm_lang(key) == forced and tracks:
-                return key, forced, "manual"
-        for key, tracks in autos.items():
-            if norm_lang(key) == forced and tracks:
-                src = "auto" if is_original_auto(tracks[0]) else "auto-translated"
-                return key, forced, src
+        key = find_track(subs, forced)
+        if key:
+            return key, forced, "manual"
+        key = find_track(autos, forced)
+        if key:
+            src = "auto" if key.endswith("-orig") or is_original_auto(autos[key][0]) else "auto-translated"
+            return key, forced, src
         return None
-    for lang in LANGS:  # ручные субтитры точнее автораскадровки
-        for key, tracks in subs.items():
-            if norm_lang(key) == lang and tracks:
-                return key, lang, "manual"
-    for lang in LANGS:  # оригинальная автораскадровка = язык видео
+
+    # Язык оригинала: метаданные видео -> ключ '-orig' -> дорожка без tlang.
+    orig_lang = ""
+    if norm_lang(video_lang) in LANGS:
+        orig_lang = norm_lang(video_lang)
+    if not orig_lang:
         for key, tracks in autos.items():
-            if norm_lang(key) == lang and tracks and is_original_auto(tracks[0]):
-                return key, lang, "auto"
-    for lang in LANGS:  # автоперевод; ru приоритетнее — конспект всё равно на русском
+            if key.endswith("-orig") and tracks and norm_lang(key) in LANGS:
+                orig_lang = norm_lang(key)
+                break
+    if not orig_lang:
         for key, tracks in autos.items():
-            if norm_lang(key) == lang and tracks:
-                return key, lang, "auto-translated"
+            if tracks and is_original_auto(tracks[0]) and norm_lang(key) in LANGS:
+                orig_lang = norm_lang(key)
+                break
+
+    if orig_lang:
+        key = find_track(subs, orig_lang)
+        if key:
+            return key, orig_lang, "manual"
+        key = find_track(autos, orig_lang, original_only=True)
+        if key:
+            return key, orig_lang, "auto"
+
+    # Оригинал не ru/en (или неизвестен): ручные ru/en, затем автоперевод
+    for lang in LANGS:
+        key = find_track(subs, lang)
+        if key:
+            return key, lang, "manual"
+    for lang in LANGS:
+        key = find_track(autos, lang)
+        if key:
+            return key, lang, "auto-translated"
     return None
 
 
@@ -245,7 +280,7 @@ def main() -> None:
 
     subs = info.get("subtitles") or {}
     autos = info.get("automatic_captions") or {}
-    chosen = choose_track(subs, autos, args.lang)
+    chosen = choose_track(subs, autos, args.lang, info.get("language") or "")
     if not chosen:
         print(
             "ОШИБКА: у видео нет субтитров на ru/en (ни ручных, ни автоматических) — обработка невозможна.",
