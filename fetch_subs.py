@@ -267,14 +267,18 @@ def main() -> None:
         sys.exit(1)
 
     vid = info.get("id") or "video"
+    # Авторы: у видео может быть несколько создателей (поле creators);
+    # fallback — владелец канала (uploader/channel).
+    authors = [c.strip() for c in (info.get("creators") or []) if c and c.strip()]
+    author = ", ".join(authors) if authors else (info.get("uploader") or info.get("channel") or "").strip()
+    title = (info.get("title") or "").strip()
+
     if args.out:
         workdir = Path(args.out)
     else:
-        # Автор в начале имени папки — чтобы work/ сортировалась по каналам.
+        # Автор(ы) в начале имени папки — чтобы work/ сортировалась по каналам.
         # Папки work/ без пробелов (подчёркивания) — удобно в терминале;
         # готовые файлы в summaries/ собираются с пробелами (для Obsidian).
-        author = (info.get("uploader") or info.get("channel") or "").strip()
-        title = (info.get("title") or "").strip()
         base = "_".join(x for x in (safe_dir_name(author), safe_dir_name(title)) if x) or vid
         workdir = ROOT / "work" / f"{base}_[{vid}]"
 
@@ -312,7 +316,8 @@ def main() -> None:
         "video_id": vid,
         "url": info.get("webpage_url") or args.url,
         "title": info.get("title") or "",
-        "author": info.get("uploader") or info.get("channel") or "",
+        "author": author,
+        "authors": authors,
         "author_url": info.get("channel_url") or info.get("uploader_url") or "",
         "thumbnail": info.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
         "duration_sec": info.get("duration"),
